@@ -74,7 +74,7 @@ def gemini_translate(part, source_language, target_language):
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is missing. Add it in Render > Environment.")
 
-    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
     prompt = (
