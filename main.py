@@ -60,66 +60,75 @@ async def process_job(job_id, input_path, target_language, voice, make_subtitles
             raise RuntimeError("No speech was detected. Try a clearer video with spoken audio.")
 
         job.update(progress=38, message=f"Translating into {target_language}…")
-        from deep_translator import GoogleTranslator
+        # Use MyMemory instead of Google Translate to avoid Google's per-second rate limit.
+        # MyMemory is a public service with daily quotas; keep requests small and sequential.
+        import json, urllib.parse, urllib.request, html
         lang_codes = {"Hindi":"hi", "English":"en", "German":"de", "Spanish":"es",
                       "French":"fr", "Japanese":"ja", "Arabic":"ar"}
         target_code = lang_codes.get(target_language)
+        source_code = getattr(info, "language", None) or "auto"
         if not target_code:
             raise RuntimeError("This target language is not configured.")
-        translator = GoogleTranslator(source="auto", target=target_code)
-
-        # Google Translate can rate-limit long transcripts if sent as one request.
-        # Split into smaller chunks and send them sequentially with a delay/retry.
-        def split_for_translation(text, limit=3000):
-            import re
-            sentences = re.split(r"(?<=[.!?।])\\s+", text.strip())
-            chunks, current = [], ""
-            for sentence in sentences:
-                if len(sentence) > limit:
-                    words = sentence.split()
-                    piece = ""
-                    for word in words:
-                        if len(piece) + len(word) + 1 > limit and piece:
-                            chunks.append(piece)
-                            piece = word
-                        else:
-                            piece = (piece + " " + word).strip()
-                    if piece:
+        if source_code == target_code:
+            translated = transcript
+        else:
+            def split_for_translation(text, limit=430):
+                import re
+                sentences = re.split(r"(?<=[.!?।])\s+", text.strip())
+                chunks, current = [], ""
+                for sentence in sentences:
+                    while len(sentence) > limit:
                         if current:
                             chunks.append(current)
                             current = ""
-                        chunks.append(piece)
-                elif len(current) + len(sentence) + 1 > limit and current:
+                        cut = sentence.rfind(" ", 0, limit)
+                        if cut < 1:
+                            cut = limit
+                        chunks.append(sentence[:cut].strip())
+                        sentence = sentence[cut:].strip()
+                    if sentence:
+                        if len(current) + len(sentence) + 1 > limit and current:
+                            chunks.append(current)
+                            current = sentence
+                        else:
+                            current = (current + " " + sentence).strip()
+                if current:
                     chunks.append(current)
-                    current = sentence
-                else:
-                    current = (current + " " + sentence).strip()
-            if current:
-                chunks.append(current)
-            return chunks or [text]
+                return chunks or [text[:limit]]
 
-        translated_parts = []
-        for index, part in enumerate(split_for_translation(transcript)):
-            result = None
-            for attempt in range(4):
-                try:
-                    result = await asyncio.to_thread(translator.translate, part)
-                    if result:
-                        break
-                except Exception:
-                    if attempt == 3:
-                        raise
-                    await asyncio.sleep(2 ** (attempt + 1))
-                if not result and attempt < 3:
-                    await asyncio.sleep(2 ** (attempt + 1))
-            if not result:
+            def mymemory_translate(part):
+                query = urllib.parse.urlencode({"q": part, "langpair": f"{source_code}|{target_code}"})
+                req = urllib.request.Request(
+                    "https://api.mymemory.translated.net/get?" + query,
+                    headers={"User-Agent": "BhashaAI/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=25) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if payload.get("responseStatus") != 200:
+                    raise RuntimeError(payload.get("responseDetails") or "Translation provider rejected the request.")
+                result = payload.get("responseData", {}).get("translatedText", "")
+                return html.unescape(result).strip()
+
+            translated_parts = []
+            parts = split_for_translation(transcript)
+            for index, part in enumerate(parts):
+                result = None
+                for attempt in range(3):
+                    try:
+                        result = await asyncio.to_thread(mymemory_translate, part)
+                        if result:
+                            break
+                        raise RuntimeError("Translation provider returned an empty result.")
+                    except Exception as exc:
+                        if attempt == 2:
+                            raise RuntimeError(f"Translation failed: {exc}")
+                        await asyncio.sleep(2 ** (attempt + 1))
+                translated_parts.append(result)
+                if index < len(parts) - 1:
+                    await asyncio.sleep(1.5)
+            translated = " ".join(translated_parts).strip()
+            if not translated:
                 raise RuntimeError("Translation service returned an empty result.")
-            translated_parts.append(result)
-            if index < len(split_for_translation(transcript)) - 1:
-                await asyncio.sleep(1.3)  # stay below Google's request-rate limit
-        translated = " ".join(translated_parts)
-        if not translated:
-            raise RuntimeError("Translation service returned an empty result.")
 
         job.update(progress=55, message="Generating dubbed voice…")
         import edge_tts
