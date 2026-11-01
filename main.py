@@ -67,7 +67,57 @@ async def process_job(job_id, input_path, target_language, voice, make_subtitles
         if not target_code:
             raise RuntimeError("This target language is not configured.")
         translator = GoogleTranslator(source="auto", target=target_code)
-        translated = translator.translate(transcript)
+
+        # Google Translate can rate-limit long transcripts if sent as one request.
+        # Split into smaller chunks and send them sequentially with a delay/retry.
+        def split_for_translation(text, limit=3000):
+            import re
+            sentences = re.split(r"(?<=[.!?।])\\s+", text.strip())
+            chunks, current = [], ""
+            for sentence in sentences:
+                if len(sentence) > limit:
+                    words = sentence.split()
+                    piece = ""
+                    for word in words:
+                        if len(piece) + len(word) + 1 > limit and piece:
+                            chunks.append(piece)
+                            piece = word
+                        else:
+                            piece = (piece + " " + word).strip()
+                    if piece:
+                        if current:
+                            chunks.append(current)
+                            current = ""
+                        chunks.append(piece)
+                elif len(current) + len(sentence) + 1 > limit and current:
+                    chunks.append(current)
+                    current = sentence
+                else:
+                    current = (current + " " + sentence).strip()
+            if current:
+                chunks.append(current)
+            return chunks or [text]
+
+        translated_parts = []
+        for index, part in enumerate(split_for_translation(transcript)):
+            result = None
+            for attempt in range(4):
+                try:
+                    result = await asyncio.to_thread(translator.translate, part)
+                    if result:
+                        break
+                except Exception:
+                    if attempt == 3:
+                        raise
+                    await asyncio.sleep(2 ** (attempt + 1))
+                if not result and attempt < 3:
+                    await asyncio.sleep(2 ** (attempt + 1))
+            if not result:
+                raise RuntimeError("Translation service returned an empty result.")
+            translated_parts.append(result)
+            if index < len(split_for_translation(transcript)) - 1:
+                await asyncio.sleep(1.3)  # stay below Google's request-rate limit
+        translated = " ".join(translated_parts)
         if not translated:
             raise RuntimeError("Translation service returned an empty result.")
 
