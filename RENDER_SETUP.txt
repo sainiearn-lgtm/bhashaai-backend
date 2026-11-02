@@ -1,0 +1,24 @@
+BhashaAI v0.4.0 setup
+====================
+
+Replace these three files in your backend repository:
+- main.py
+- requirements.txt
+- Dockerfile
+
+Render environment variables:
+- GEMINI_API_KEY = your Google AI Studio API key
+- GEMINI_MODEL = gemini-2.5-flash (keep your currently working model if different)
+- GEMINI_FALLBACK_MODEL = optional; set only to a model enabled for your API key
+- WHISPER_MODEL = tiny
+- WHISPER_CPU_THREADS = 2
+- TTS_CONCURRENCY = 2
+- MAX_UPLOAD_MB = 200
+
+Important:
+1. This version stores job metadata in SQLite inside DATA_DIR (default /app/data).
+2. For jobs to survive Render restarts/redeploys, attach a Render persistent disk and set DATA_DIR to its mount path, e.g. /var/data. Without a persistent disk, local SQLite and output files can be lost.
+3. A job interrupted by a server restart is marked failed; it is not automatically resumed. Users can refresh the page and retrieve completed job status using GET /api/jobs/{job_id}, as long as the disk persists.
+4. The existing frontend must poll GET /api/jobs/{job_id} and build download links using the backend base URL plus output_url/subtitle_url.
+5. Keep the existing frontend API base URL: https://bhashaai-backend-yr98.onrender.com
+6. Do not expose GEMINI_API_KEY in frontend code.
