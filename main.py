@@ -256,10 +256,31 @@ def update(job_id, **changes):
     save_job(job_id, **changes)
 
 
-async def create_tts_part(text, voice, path):
+def get_voice_tuning(voice_style):
+    settings = {
+        "Natural voice (default)": {"rate": "+0%", "pitch": "+0Hz"},
+        "Warm and friendly": {"rate": "-4%", "pitch": "+1Hz"},
+        "Professional": {"rate": "-5%", "pitch": "-1Hz"},
+        "Energetic": {"rate": "+5%", "pitch": "+1Hz"},
+    }
+    return settings.get(
+        voice_style,
+        settings["Natural voice (default)"]
+    )
+
+
+async def create_tts_part(text, voice, path, voice_style="Natural voice (default)"):
     import edge_tts
+
+    tuning = get_voice_tuning(voice_style)
     async with TTS_SEMAPHORE:
-        communicate = edge_tts.Communicate(text, voice)
+        communicate = edge_tts.Communicate(
+            text,
+            voice,
+            rate=tuning["rate"],
+            pitch=tuning["pitch"],
+            volume="+0%"
+        )
         await communicate.save(str(path))
 
 
@@ -323,7 +344,7 @@ async def process_job(job_id, input_path, target_language, voice_style, make_sub
         chunks = split_text(translated)
         audio_parts = [work / f"voice_{i:03}.mp3" for i in range(len(chunks))]
         await asyncio.gather(*[
-            create_tts_part(chunk, voice, path)
+            create_tts_part(chunk, voice, path, voice_style)
             for chunk, path in zip(chunks, audio_parts)
         ])
 
