@@ -29,6 +29,8 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 WHISPER_MODEL = None
 WHISPER_LOCK = threading.Lock()
+DIARIZATION_PIPELINE = None
+DIARIZATION_LOCK = threading.Lock()
 TTS_SEMAPHORE = asyncio.Semaphore(TTS_CONCURRENCY)
 
 LANG_NAMES = {
@@ -252,6 +254,109 @@ def get_whisper_model():
     return WHISPER_MODEL
 
 
+def get_diarization_pipeline():
+    """Load the gated pyannote speaker-diarization model once per server process."""
+    global DIARIZATION_PIPELINE
+    token = os.getenv("HF_TOKEN", "").strip()
+    if not token:
+        return None
+
+    if DIARIZATION_PIPELINE is None:
+        with DIARIZATION_LOCK:
+            if DIARIZATION_PIPELINE is None:
+                from pyannote.audio import Pipeline
+                DIARIZATION_PIPELINE = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-community-1",
+                    token=token
+                )
+                # Render CPU deployment: keep inference on CPU.
+                try:
+                    import torch
+                    DIARIZATION_PIPELINE.to(torch.device("cpu"))
+                except Exception:
+                    pass
+    return DIARIZATION_PIPELINE
+
+
+def build_speaker_turns(whisper_segments, diarization=None):
+    """
+    Convert Whisper word timestamps into consecutive speaker turns.
+    If diarization is unavailable, use Whisper segment timestamps as one speaker.
+    """
+    diarized_regions = []
+    if diarization is not None:
+        annotation = getattr(diarization, "speaker_diarization", diarization)
+        for region, _, speaker in annotation.itertracks(yield_label=True):
+            diarized_regions.append((float(region.start), float(region.end), str(speaker)))
+
+    words = []
+    for segment in whisper_segments:
+        segment_start = float(getattr(segment, "start", 0.0))
+        segment_end = float(getattr(segment, "end", segment_start + 1.0))
+        segment_words = getattr(segment, "words", None) or []
+
+        if segment_words:
+            for word in segment_words:
+                word_start = float(getattr(word, "start", segment_start))
+                word_end = float(getattr(word, "end", segment_end))
+                word_text = str(getattr(word, "word", "")).strip()
+                if word_text:
+                    words.append((word_start, max(word_start + 0.01, word_end), word_text))
+        else:
+            text = str(getattr(segment, "text", "")).strip()
+            if text:
+                words.append((segment_start, max(segment_start + 0.01, segment_end), text))
+
+    turns = []
+    for start, end, word_text in words:
+        speaker = "SPEAKER_00"
+        if diarized_regions:
+            midpoint = (start + end) / 2
+            overlaps = [
+                (max(0.0, min(end, region_end) - max(start, region_start)), label)
+                for region_start, region_end, label in diarized_regions
+                if region_start <= midpoint <= region_end
+                or min(end, region_end) > max(start, region_start)
+            ]
+            if overlaps:
+                speaker = max(overlaps, key=lambda item: item[0])[1]
+
+        if turns and turns[-1]["speaker"] == speaker and start - turns[-1]["end"] <= 1.25:
+            turns[-1]["text"] = (turns[-1]["text"] + " " + word_text).strip()
+            turns[-1]["end"] = end
+        else:
+            turns.append({
+                "speaker": speaker,
+                "start": start,
+                "end": end,
+                "text": word_text
+            })
+
+    return [turn for turn in turns if turn["text"].strip()]
+
+
+def choose_speaker_voice(target_language, speaker_number, voice_style):
+    """
+    Assign distinct configured voices automatically by speaker order.
+    Current language voice sets contain up to two distinct voices; additional
+    speakers cycle through those voices.
+    """
+    language_voices = VOICE_MAP.get(target_language, {})
+    preferred = language_voices.get(voice_style)
+    if target_language in ("Hindi", "English", "German"):
+        if target_language == "Hindi":
+            pool = ["hi-IN-SwaraNeural", "hi-IN-MadhurNeural"]
+        elif target_language == "English":
+            pool = ["en-IN-NeerjaNeural", "en-IN-PrabhatNeural"]
+        else:
+            pool = ["de-DE-KatjaNeural", "de-DE-ConradNeural"]
+        # Keep the selected style's first-speaker voice when possible.
+        if preferred in pool:
+            pool = [preferred] + [v for v in pool if v != preferred]
+        return pool[speaker_number % len(pool)]
+    return EXTRA_VOICES.get(target_language)
+
+
 def update(job_id, **changes):
     save_job(job_id, **changes)
 
@@ -284,6 +389,64 @@ async def create_tts_part(text, voice, path, voice_style="Natural voice (default
         await communicate.save(str(path))
 
 
+def subtitle_stamp(seconds):
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, milliseconds = divmod(milliseconds, 3600000)
+    minutes, milliseconds = divmod(milliseconds, 60000)
+    secs, milliseconds = divmod(milliseconds, 1000)
+    return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
+
+
+def make_caption_chunks(text, max_chars=76):
+    sentences = [x.strip() for x in re.split(r"(?<=[.!?।؟])\s+", text.strip()) if x.strip()]
+    if not sentences and text.strip():
+        sentences = [text.strip()]
+    captions = []
+    for sentence in sentences:
+        current = ""
+        for word in sentence.split():
+            candidate = f"{current} {word}".strip()
+            if len(candidate) > max_chars and current:
+                captions.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            captions.append(current)
+    return captions
+
+
+def write_turn_subtitles(turns, audio_parts, srt_path):
+    """Time translated captions to each dubbed speaker clip and its audio delay."""
+    entries = []
+    for turn, (audio_path, delay_ms) in zip(turns, audio_parts):
+        duration_text = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
+            text=True
+        )
+        clip_duration = max(0.25, float(duration_text.strip()))
+        captions = make_caption_chunks(turn.get("translation", ""))
+        if not captions:
+            continue
+        weights = [max(1, len(item)) for item in captions]
+        total_weight = sum(weights)
+        cursor = delay_ms / 1000.0
+        for index, (caption, weight) in enumerate(zip(captions, weights)):
+            start = cursor
+            end = delay_ms / 1000.0 + clip_duration if index == len(captions) - 1 else cursor + clip_duration * weight / total_weight
+            entries.append((start, end, caption))
+            cursor = end
+    entries.sort(key=lambda item: (item[0], item[1]))
+    if not entries:
+        return False
+    lines = []
+    for index, (start, end, caption) in enumerate(entries, start=1):
+        lines.extend([str(index), f"{subtitle_stamp(start)} --> {subtitle_stamp(end)}", caption, ""])
+    srt_path.write_text("\n".join(lines), encoding="utf-8")
+    return True
+
+
 async def process_job(job_id, input_path, target_language, voice_style, make_subtitles, keep_background):
     work = DATA / job_id
     work.mkdir(exist_ok=True)
@@ -302,7 +465,7 @@ async def process_job(job_id, input_path, target_language, voice_style, make_sub
         segments, info = await asyncio.to_thread(
             lambda: model.transcribe(
                 str(wav), beam_size=1, best_of=1, vad_filter=True,
-                condition_on_previous_text=False
+                condition_on_previous_text=False, word_timestamps=True
             )
         )
         source_segments = await asyncio.to_thread(list, segments)
@@ -315,92 +478,136 @@ async def process_job(job_id, input_path, target_language, voice_style, make_sub
         target_code = TARGET_CODES.get(target_language)
         if not target_code:
             raise RuntimeError("Unsupported target language.")
-        update(job_id, progress=36, message=f"Translating into {target_language}…")
 
-        if source_code == target_code:
-            translated = transcript
-        else:
-            parts = split_for_translation(transcript)
-            translated_parts = []
-            for i, part in enumerate(parts):
-                update(
-                    job_id,
-                    progress=36 + int((i / max(1, len(parts))) * 16),
-                    message=f"Translating part {i + 1}/{len(parts)}…"
+        update(job_id, progress=28, message="Detecting speakers…")
+        diarization = None
+        try:
+            pipeline = await asyncio.to_thread(get_diarization_pipeline)
+            if pipeline is not None:
+                diarization = await asyncio.to_thread(pipeline, str(wav))
+        except Exception as exc:
+            # Keep the dubbing workflow usable if the optional gated model is
+            # not configured or cannot load on the current hosting instance.
+            update(
+                job_id, progress=30,
+                message=f"Speaker detection unavailable; using one voice ({type(exc).__name__})."
+            )
+
+        turns = build_speaker_turns(source_segments, diarization)
+        if not turns:
+            turns = [{
+                "speaker": "SPEAKER_00", "start": 0.0,
+                "end": 1.0, "text": transcript
+            }]
+
+        speaker_order = []
+        for turn in turns:
+            if turn["speaker"] not in speaker_order:
+                speaker_order.append(turn["speaker"])
+        speaker_numbers = {name: i for i, name in enumerate(speaker_order)}
+
+        update(job_id, progress=36, message=f"Translating {len(turns)} dialogue turns…")
+        for i, turn in enumerate(turns):
+            if source_code == target_code:
+                turn["translation"] = turn["text"]
+            else:
+                turn["translation"] = await asyncio.to_thread(
+                    gemini_translate, turn["text"], source_name, target_language
                 )
-                translated_parts.append(await asyncio.to_thread(
-                    gemini_translate, part, source_name, target_language
-                ))
-                # Avoid bursts against free-tier rate limits.
-                if i < len(parts) - 1:
-                    await asyncio.sleep(0.4)
-            translated = " ".join(translated_parts).strip()
+            update(
+                job_id,
+                progress=36 + int(((i + 1) / max(1, len(turns))) * 18),
+                message=f"Translating dialogue {i + 1}/{len(turns)}…"
+            )
+            if i < len(turns) - 1 and source_code != target_code:
+                await asyncio.sleep(0.25)
 
-        voice = VOICE_MAP.get(target_language, {}).get(voice_style) or EXTRA_VOICES.get(target_language)
-        if not voice:
-            raise RuntimeError("No voice configured for this language.")
-
-        update(job_id, progress=55, message="Generating dubbed voice…")
-        chunks = split_text(translated)
-        audio_parts = [work / f"voice_{i:03}.mp3" for i in range(len(chunks))]
-        await asyncio.gather(*[
-            create_tts_part(chunk, voice, path, voice_style)
-            for chunk, path in zip(chunks, audio_parts)
-        ])
-
-        concat_file = work / "concat.txt"
-        concat_file.write_text(
-            "".join(f"file '{p.as_posix()}'\n" for p in audio_parts),
-            encoding="utf-8"
+        update(
+            job_id, progress=55,
+            message=f"Generating voices for {len(speaker_order)} speaker(s)…"
         )
-        dubbed_audio = work / "dubbed.mp3"
-        await asyncio.to_thread(run_cmd, [
-            "ffmpeg", "-nostdin", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_file), "-c", "copy", str(dubbed_audio)
-        ])
+        audio_parts = []
+        for i, turn in enumerate(turns):
+            voice = choose_speaker_voice(
+                target_language,
+                speaker_numbers[turn["speaker"]],
+                voice_style
+            )
+            if not voice:
+                raise RuntimeError("No voice configured for this language.")
+            audio_path = work / f"speaker_turn_{i:04}.mp3"
+            await create_tts_part(
+                turn["translation"], voice, audio_path, voice_style
+            )
+            audio_parts.append((audio_path, max(0, int(turn["start"] * 1000))))
 
-        update(job_id, progress=76, message="Creating final video…")
+        # Place each translated turn at its original speech start time.
+        # This preserves conversational order and reduces speaker overlap.
+        filter_parts = []
+        for i, (_, delay_ms) in enumerate(audio_parts):
+            filter_parts.append(
+                f"[{i}:a]adelay={delay_ms}|{delay_ms},volume=1.0[a{i}]"
+            )
+        mix_inputs = "".join(f"[a{i}]" for i in range(len(audio_parts)))
+        filter_parts.append(
+            f"{mix_inputs}amix=inputs={len(audio_parts)}:duration=longest:"
+            "dropout_transition=0[dub]"
+        )
+        dubbed_audio = work / "dubbed.m4a"
+        mix_cmd = ["ffmpeg", "-nostdin", "-y"]
+        for audio_path, _ in audio_parts:
+            mix_cmd.extend(["-i", str(audio_path)])
+        mix_cmd.extend([
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[dub]", "-c:a", "aac", "-b:a", "128k",
+            str(dubbed_audio)
+        ])
+        await asyncio.to_thread(run_cmd, mix_cmd)
+
+        # Keep a readable combined translation in the job result.
+        translated = "\n".join(
+            f'{turn["speaker"]}: {turn["translation"]}' for turn in turns
+        )
+
+        subtitle_filter = None
+        if make_subtitles:
+            update(job_id, progress=84, message="Preparing dubbed-language subtitles…")
+            srt = work / "dubbed_subtitles.srt"
+            if write_turn_subtitles(turns, audio_parts, srt):
+                style = (
+                    "FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,"
+                    "OutlineColour=&H00000000,BorderStyle=1,Outline=2,"
+                    "Shadow=1,Alignment=2,MarginV=28"
+                )
+                subtitle_filter = f"subtitles=filename='{srt.as_posix()}':force_style='{style}'"
+
+        update(job_id, progress=90 if make_subtitles else 84, message="Rendering final video…")
         output = DATA / f"{job_id}_dubbed.mp4"
         if keep_background:
             cmd = [
                 "ffmpeg", "-nostdin", "-y", "-i", str(input_path), "-i", str(dubbed_audio),
                 "-filter_complex",
                 "[0:a]volume=0.16[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=first:dropout_transition=2[a]",
-                "-map", "0:v:0", "-map", "[a]", "-c:v", "copy", "-c:a", "aac",
-                "-b:a", "128k", "-shortest", str(output)
+                "-map", "0:v:0", "-map", "[a]"
             ]
         else:
             cmd = [
                 "ffmpeg", "-nostdin", "-y", "-i", str(input_path), "-i", str(dubbed_audio),
-                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-                "-b:a", "128k", "-shortest", str(output)
+                "-map", "0:v:0", "-map", "1:a:0"
             ]
+        if subtitle_filter:
+            cmd += ["-vf", subtitle_filter]
+        cmd += [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-shortest", str(output)
+        ]
         await asyncio.to_thread(run_cmd, cmd)
-
-        subtitle_url = None
-        if make_subtitles:
-            update(job_id, progress=91, message="Writing translated subtitles…")
-            srt = DATA / f"{job_id}_translated.srt"
-            duration_text = await asyncio.to_thread(
-                subprocess.check_output,
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(output)],
-                text=True
-            )
-            duration = max(1.0, float(duration_text.strip()))
-            ms = int(duration * 1000)
-            h, ms = divmod(ms, 3600000)
-            m, ms = divmod(ms, 60000)
-            s, ms = divmod(ms, 1000)
-            stamp = f"{h:02}:{m:02}:{s:02},{ms:03}"
-            srt.write_text(f"1\n00:00:00,000 --> {stamp}\n{translated}\n", encoding="utf-8")
-            subtitle_url = f"/files/{srt.name}"
 
         update(
             job_id, status="completed", progress=100,
             message="Your dubbed video is ready.",
             output_url=f"/files/{output.name}",
-            subtitle_url=subtitle_url, transcript=transcript, translation=translated,
+            subtitle_url=None, transcript=transcript, translation=translated,
             error=None
         )
     except Exception as exc:
@@ -418,7 +625,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="BhashaAI API", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="BhashaAI API", version="0.4.1", lifespan=lifespan)
 
 origins = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "*").split(",") if x.strip()]
 app.add_middleware(
@@ -433,12 +640,12 @@ app.mount("/files", StaticFiles(directory=DATA), name="files")
 
 @app.get("/")
 def root():
-    return {"service": "BhashaAI API", "version": "0.4.0", "docs": "/docs"}
+    return {"service": "BhashaAI API", "version": "0.4.1", "docs": "/docs"}
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "BhashaAI API", "version": "0.4.0"}
+    return {"ok": True, "service": "BhashaAI API", "version": "0.4.1"}
 
 
 @app.post("/api/dub")
